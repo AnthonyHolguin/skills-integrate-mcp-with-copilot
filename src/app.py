@@ -5,19 +5,64 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import hmac
+import os
+import secrets
+import time
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
+app.mount("/static", StaticFiles(directory=os.path.join(current_dir,
           "static")), name="static")
+
+SESSION_COOKIE = "teacher_session"
+SESSION_TTL_SECONDS = 60 * 60
+COOKIE_SECURE = os.getenv("ENVIRONMENT", "development").lower() == "production"
+teacher_sessions: dict[str, tuple[str, float]] = {}
+
+
+class TeacherCredentials(BaseModel):
+    username: str
+    password: str
+
+
+def _session_for_request(request: Request) -> tuple[str, str] | None:
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if not session_id:
+        return None
+
+    session = teacher_sessions.get(session_id)
+    if session is None:
+        return None
+
+    username, expires_at = session
+    if expires_at <= time.time():
+        teacher_sessions.pop(session_id, None)
+        return None
+
+    return session_id, username
+
+
+def require_teacher(request: Request) -> str:
+    session = _session_for_request(request)
+    if session is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+
+    origin = request.headers.get("origin")
+    expected_origin = str(request.base_url).rstrip("/")
+    if origin != expected_origin:
+        raise HTTPException(status_code=403, detail="Request origin not allowed")
+
+    return session[1]
 
 # In-memory activity database
 activities = {
@@ -83,13 +128,86 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/auth/login")
+def login(credentials: TeacherCredentials, response: Response):
+    configured_username = os.getenv("TEACHER_USERNAME", "")
+    configured_password = os.getenv("TEACHER_PASSWORD", "")
+    if not configured_username or not configured_password:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher login is not configured",
+        )
+
+    username_matches = hmac.compare_digest(
+        credentials.username.encode("utf-8"),
+        configured_username.encode("utf-8"),
+    )
+    password_matches = hmac.compare_digest(
+        credentials.password.encode("utf-8"),
+        configured_password.encode("utf-8"),
+    )
+    if not (username_matches and password_matches):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    now = time.time()
+    expired_sessions = [
+        session_id for session_id, (_, expires_at) in teacher_sessions.items()
+        if expires_at <= now
+    ]
+    for session_id in expired_sessions:
+        teacher_sessions.pop(session_id, None)
+
+    session_id = secrets.token_urlsafe(32)
+    teacher_sessions[session_id] = (
+        configured_username,
+        now + SESSION_TTL_SECONDS,
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=session_id,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"username": configured_username}
+
+
+@app.get("/auth/session")
+def get_session(request: Request):
+    session = _session_for_request(request)
+    if session is None:
+        return {"authenticated": False}
+    return {"authenticated": True, "username": session[1]}
+
+
+@app.post("/auth/logout")
+def logout(request: Request, response: Response):
+    session = _session_for_request(request)
+    if session is not None:
+        teacher_sessions.pop(session[0], None)
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Logged out"}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    _: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +229,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
